@@ -16,6 +16,11 @@ from server.focus_policy import finalize_work_focus_modifiers
 from server.whole_turn_control import whole_turn_owner, resolve_whole_turn_references
 from server.work_planner_prompt import get_work_planner_prompt, project_work_planner_messages
 from server.reference_catalog import candidate_catalog_from_coordinator
+from server.execution_self_knowledge import (
+    build_execution_context,
+    enrich_delegate_work_items,
+    render_execution_context_block,
+)
 
 
 APP_WORK_SCOPE = (
@@ -134,6 +139,21 @@ class RuntimeWorkPlanner:
         semantic_prompt = get_work_planner_prompt(tuple(sorted(provider_ids)))
         if current_work_facts is not None:
             semantic_prompt += _render_current_work_facts(current_work_facts)
+        active_work = None
+        if ingress.loop.active_work is not None:
+            active_work = ingress.loop.active_work(ingress.loop.bound_context_id)
+        work_items = enrich_delegate_work_items(
+            self.coordinator,
+            self.coordinator.conversation_work_items(ingress.session_id, limit=4),
+        )
+        execution_context = build_execution_context(
+            context_requirements=ingress.loop.context_requirements,
+            runtime=ingress.loop.runtime,
+            current_work=current_work_facts,
+            active_work=active_work,
+            work_items=work_items,
+        )
+        semantic_prompt += render_execution_context_block(execution_context)
         provider_message = isinstance(receipt.get("provider_message_action"), Mapping)
         if provider_message:
             semantic_prompt += "\n\n" + PROVIDER_MESSAGE_SCOPE

@@ -57,16 +57,17 @@ from llm.prompts import WORK_AMEND_SEMANTICS_JA, work_retract_guidance_ja
 _COORDINATION_JSON_OUTPUT = """JSONオブジェクトを正確に一つだけ返してください。ルートのキーはactionとsayの二つだけで、
 この順序を維持してください。sayは文字列です。actionの値はnull、またはopを含むオブジェクトです。
 操作を指定しない場合の完全な応答は次の形式です。
-  {"action":null,"say":"キャラクターの表現方針に沿った自然な役割応答"}
+  {"action":null,"say":"ええ、それは整理が必要ね。順に見てみましょう。"}
 操作を指定する場合の完全な応答の例は次のとおりです。
-  {"action":{"op":"work","intent":"execute"},"say":"では、作り始めるわ。"}
+  {"action":{"op":"work","intent":"execute"},"say":"わかった、作ってみるわ。"}
+sayはユーザーの話題に触れる自然な一文から書くこと。
 以下はaction内部のフィールドとその意味です。操作ごとに示すフィールドをactionに入れ、
 応答全体は上記と同じactionとsayのルートにしてください。
 """
 
 _INLINE_ROLE_OUTPUT = """自然な役割応答を本文としてそのまま返してください。JSONの外枠やsayキーを出しません。
-まず短い自然な一言を話し、操作が必要なら、渡す準備ができた位置にDELEGATEタグを一つ置きます。
-たとえば「ええ、作ってみるわ。[DELEGATE op=work]」。長い説明を全部話してから委派してはいけません。
+まずユーザーの話題に触れる自然な一文から始め、操作が必要なら、渡す準備ができた位置にDELEGATEタグを一つ置きます。
+たとえば「わかった、作ってみるわ。[DELEGATE op=work]」。長い説明を全部話してから委派してはいけません。
 タグが閉じた時点でHostが専門判断へ引き渡します。そこでこの役割出力は終わりです。
 以下のactionは操作の意味を、sayはあなたが話す本文を指す説明上の名前です。
 action=nullとはタグを付けず普通に話すことです。JSONを出す指示ではありません。
@@ -79,7 +80,7 @@ op=sendは既存タスクについての質問・回答・補足情報や、交�
 [DELEGATE op=interrupt target="先ほどの調査"]、[DELEGATE op=scope_change target="今後の既定接続先"]、
 [DELEGATE op=delegate provider="登録済みの正確なid"]。
 複数語の属性値は引用符で囲みます。タグ自体は読み上げません。
-最初の出力は短い話し言葉です。先頭を「[」や「{」にせず、最初の相づちと句読点までを先に出します。
+先頭を「[」や「{」にせず、話題に触れる自然な話し言葉から始めます。
 表情はその後に[EMO thinking]のように挿入し、durは指定しません。
 history内の古い返答が表情タグから始まっていても、その出力順序は模倣しません。
 """
@@ -288,7 +289,9 @@ Work操作に当たらない外部の観測が必要なら、ユーザーの要�
 last_runは実行履歴を示し、会話の終了を意味しません。runを停止または完了しても、宛先は維持されます。
 last_run.reported_progressは実行側から届いた進捗報告で、完成の証明ではありません。
 last_run.pending_permissionsはHostが保持する現在の承認待ちです。これらで状況に答えられる場合は、
-その事実を伝えてください。既に分かっている状況を聞き直すためだけにsendを出す必要はありません。
+その事実を伝えてください。既に分かっている状況を聞き回すためだけにsendを出す必要はありません。
+execution_context.task_health.recommended_actions_jaはHostが提示する回復手順です。
+これを無視して別Providerへ切り替えたり、受領前に成功と述べたりしてはいけません。
 閉じた、または利用できない接続先はHostによる解決が必要です。回避策として新たに実行してはいけません。
 scope_changeの要求を適用済みとして説明してはいけません。
 この応答で選ぶ操作は提案です。依頼に応じる意向、相談や提案には自然に応じてかまいません。
@@ -359,6 +362,11 @@ scopeの変更を、適用済みと主張してはいけません。
   内部の計画・接続・検証エラーは処理側の失敗です。そのコードだけから、ユーザーの依頼が仕様上禁止、
   未対応、または言い方が悪いと推測してはいけません。内部コードの逐語訳や長い弁明は不要です。
   まだ着手できていない等の確認済み事実と、具体的に分かっている原因だけを短く伝えてください。
+  frame.recovery.recommended_actions_jaがある場合、ユーザーが次に取れる具体的手順として短く案内してください。
+  frame.execution_contextがある場合、委任先（codex/pi 等）の実行状態・エラー・承認待ちを
+  あなた自身の責任として説明し、内部エージェントへ丸投げしないでください。
+  runtime_snapshot と delegate_guides を使い、Provider の報告をそのまま読み上げず、
+  ユーザーが次に何をすべきかを短く案内してください。
   state=work_auip_independentは、同じ発話をWorkとアプリの担当がそれぞれ確認した結果です。
   この状態名だけでは、独立したWorkの依頼が存在するとは限りません。questionに一つの自然な応答で答え、
   アプリの状態はapp_read_facts、成果物の作成・変更・照会・取消に関する結果はworkの受領記録に基づきます。
@@ -505,7 +513,8 @@ class CooperativeProviderLoop:
                  browser_context: Callable[[Mapping[str, Any] | None], dict | None]
                     | None = None, idle_context_budget: int = 4,
                  work_proposals_only: bool = False,
-                 history_source: Callable[[str], tuple[dict, ...]] | None = None):
+                 history_source: Callable[[str], tuple[dict, ...]] | None = None,
+                 execution_context: Callable[[str], dict | None] | None = None):
         self.runtime, self.query, self.allocate = runtime, query, allocate
         self._query_streams = any(parameter.name == "on_text"
             or parameter.kind == inspect.Parameter.VAR_KEYWORD
@@ -521,6 +530,7 @@ class CooperativeProviderLoop:
         self.task_contexts = task_contexts
         self.browser_context = browser_context
         self.history_source = history_source
+        self.execution_context = execution_context
         self.work_proposals_only = bool(work_proposals_only)
         self.system = persona + "\n\n" + _role_coordination_contract(self.work_proposals_only)
         self.presentation_system = persona + "\n\n" + PRESENTATION_CONTRACT
@@ -1117,6 +1127,10 @@ class CooperativeProviderLoop:
                     frame["app_context"] = app_context
             if auip_entry is not None:
                 system += "\n\n" + auip_entry["prompt"]
+            if self.execution_context is not None:
+                execution = self.execution_context(child_id)
+                if isinstance(execution, Mapping) and execution:
+                    frame["execution_context"] = dict(execution)
             if auip_context is not None:
                 frame["auip_context"] = dict(auip_context)
                 system += ("\nHostはアプリ側を別途処理します。このターンでここから提案する操作はWorkだけで、なければaction=nullです。"
@@ -1138,6 +1152,25 @@ class CooperativeProviderLoop:
             # needs expression. Replaying action-oriented dialogue here can make
             # an earlier acknowledgement look like the current outcome.
             frame = {"source_kind":event["source"], "current":event}
+            if self.execution_context is not None:
+                context_id = str(
+                    event.get("child_id") or self.bound_context_id or ""
+                ).strip()
+                execution = self.execution_context(context_id)
+                if isinstance(execution, Mapping) and execution:
+                    frame["execution_context"] = dict(execution)
+            if event.get("source") == "host_receipt":
+                recovery = event.get("recovery")
+                if isinstance(recovery, Mapping) and recovery:
+                    frame["recovery"] = dict(recovery)
+                else:
+                    reason = str(event.get("reason") or "").strip()
+                    if reason:
+                        from server.execution_self_knowledge import recovery_hints_for_reason
+
+                        hints = recovery_hints_for_reason(reason)
+                        if hints:
+                            frame["recovery"] = hints
             app_session_id = str(
                 event.get("app_session_id")
                 or (

@@ -750,9 +750,9 @@ class CooperativeChatManager:
         self.publish_factory = publish_factory
         self.role_provider_selector = role_provider_selector
         self.permission_policy = str(permission_policy or "").strip().lower()
-        if self.permission_policy not in {"", "deny", "ask"}:
+        if self.permission_policy not in {"", "deny", "ask", "allow"}:
             raise ValueError("unsupported cooperative permission policy")
-        if self.permission_policy in {"deny", "ask"} and not isinstance(
+        if self.permission_policy in {"deny", "ask", "allow"} and not isinstance(
                 permission_store, WorkLedgerStore):
             raise ValueError("cooperative permission policy requires durable storage")
         self.permission_store = permission_store
@@ -803,7 +803,7 @@ class CooperativeChatManager:
             authority_mode="turn_decision", turn_runner=self.run,
             admission_preparer=self.prepare_session, allows_pending=True)
         sm.configure_activation_guard(self._activation_guard)
-        if self.permission_policy in {"deny", "ask"}:
+        if self.permission_policy in {"deny", "ask", "allow"}:
             bus.on(Method.PROVIDER_EVENT, self._handle_provider_event)
         if self.permission_policy == "ask":
             bus.on(Method.SESSION_CHANGED, self._handle_permission_session_changed)
@@ -937,7 +937,9 @@ class CooperativeChatManager:
                         app_session_id=app_session_id,
                         transition_action=transition_action),
                 browser_context=lambda scope:self.browser_context_for_session(
-                    session_id, scope))
+                    session_id, scope),
+                execution_context=lambda context_id:self.execution_context_for_recipient(
+                    session_id, context_id))
             ingress = CooperativeChatIngress(loop, session_id=session_id, ledger=self.ledger,
                 fence_scope=self.fence_scope, handler=self.handler, configure_handler=False,
                 install_runtime_hooks=False, scope_request=self.request_scope_change,
@@ -2176,6 +2178,47 @@ class CooperativeChatManager:
         if input_requirements:
             projected["input_requirements"] = input_requirements
         return projected
+
+    def execution_context_for_recipient(self, session_id: str, context_id: str) -> dict | None:
+        """Build Host-owned execution self-knowledge for one receiving address."""
+
+        from server.execution_self_knowledge import (
+            build_execution_context,
+            enrich_delegate_work_items,
+        )
+
+        current_work = self.work_for_recipient(session_id, context_id)
+        active_work = self.active_work_for_recipient(session_id, context_id)
+        work_items = []
+        pending_permissions = []
+        if self.work_executor is not None:
+            work_items = enrich_delegate_work_items(
+                self.work_executor.coordinator,
+                self.work_executor.coordinator.conversation_work_items(
+                    session_id, limit=4))
+        ingress = self.ingresses.get(session_id)
+        child_id = str(context_id or "")
+        if ingress is not None and self.permission_store is not None:
+            run_id = ""
+            if child_id:
+                child = ingress.loop.get_context(child_id)
+                if child is not None:
+                    run_id = str(child.run_id or "")
+            pending = self.permission_store.list_cooperative_permission_requests(
+                session_id, context_id=child_id, provider_run_id=run_id, status="pending")
+            pending_permissions = [{"reason":item.reason, "action":item.action,
+                "scope":list(item.scope_paths)[:2]} for item in pending[:3]]
+        manifests = {provider:self.runtime.get_manifest(provider)
+            for provider in self.context_requirements}
+        return build_execution_context(
+            context_requirements=self.context_requirements,
+            manifests=manifests,
+            runtime=self.runtime,
+            current_work=current_work,
+            active_work=active_work,
+            work_items=work_items,
+            pending_permissions=pending_permissions,
+        )
 
     @staticmethod
     def role_app_context_for_session(
@@ -3573,10 +3616,17 @@ class CooperativeChatManager:
     async def _present_preaccepted_planned_rejection(self, ingress, turn_id: str,
                                                       receipt: dict, admission,
                                                       reason: str) -> dict:
+        from server.execution_self_knowledge import enrich_rejection_receipt
+
         result = {"state":"rejected", "reason":reason,
             "input_id":admission.utterance_id,
             "utterance_id":admission.utterance_id, "turn_id":turn_id,
             "child_id":str(receipt.get("child_id") or "")}
+        result = enrich_rejection_receipt(result, context={
+            "current_work": self.work_for_recipient(
+                ingress.session_id, str(receipt.get("child_id") or "")),
+            "planned_provider": str(receipt.get("planned_provider") or "").strip(),
+        })
         ingress.receipts[admission.utterance_id] = result
         if receipt.get("_host_defer_work_started_presentation") is not True:
             try:
@@ -4442,7 +4492,7 @@ class CooperativeChatManager:
 
     async def _handle_provider_event(self, _method: str, params: dict) -> None:
         event_type = str(params.get("type") or "").lower()
-        if self.permission_policy not in {"deny", "ask"} or event_type not in {
+        if self.permission_policy not in {"deny", "ask", "allow"} or event_type not in {
             "permission.requested", "permission.required", "permission.expired",
         }:
             return
@@ -4522,6 +4572,15 @@ class CooperativeChatManager:
             normalized_options.append("deny")
         ask_user = (self.permission_policy == "ask"
             and child.requirements.workspace_access != "read")
+        auto_allow = (self.permission_policy == "allow"
+            and child.requirements.workspace_access != "read")
+        if auto_allow and "allow_once" not in normalized_options:
+            normalized_options.insert(0, "allow_once")
+        resolution_policy = (
+            "user_prompt" if ask_user
+            else "automatic_allow" if auto_allow
+            else "automatic_deny"
+        )
         permission = self.permission_store.create_cooperative_permission_request(
             session_id=session_id, context_id=context_id, provider_run_id=run_id,
             capability=str(source.get("capability") or "tool.execute")[:120],
@@ -4529,12 +4588,13 @@ class CooperativeChatManager:
             scope_paths=scope_paths,
             reason=str(source.get("reason") or "Explicit user approval is required.")[:1000],
             reversibility=str(source.get("reversibility") or "unknown")[:240],
-            options=normalized_options if ask_user else ["deny"],
+            options=(normalized_options if ask_user
+                else ["allow_once"] if auto_allow else ["deny"]),
             idempotency_key=f"provider:{provider}:{run_id}:{request_id}",
             metadata={"kind":"provider_permission", "provider":provider,
                 "provider_request_id":request_id,
                 "provider_options":[str(value)[:80] for value in provider_options[:8]],
-                "resolution_policy":"user_prompt" if ask_user else "automatic_deny"})
+                "resolution_policy":resolution_policy})
         if permission.status != "pending":
             self.permission_receipts.append({"session_id":session_id,
                 "context_id":context_id, "run_id":run_id,
@@ -4552,15 +4612,17 @@ class CooperativeChatManager:
             if sm.get_current_session_id() == session_id:
                 await self._emit_cooperative_permission_canvas(permission, visible=True)
             return
+        allow = auto_allow
         outcome = await self.runtime.resolve_permission(run_id, ProviderPermissionResponse(
-            request_id=request_id, allow=False, automatic=True,
-            reason=("cooperative_read_only_context"
+            request_id=request_id, allow=allow, automatic=True,
+            reason=("cooperative_permission_policy_allow" if allow
+                else "cooperative_read_only_context"
                 if child.requirements.workspace_access == "read"
                 else "cooperative_permission_policy_deny")))
         if outcome.get("accepted") is True:
             permission = self.permission_store.resolve_permission_request(
-                permission.request_id, "denied",
-                metadata={"resolution":"policy_denied",
+                permission.request_id, "allowed" if allow else "denied",
+                metadata={"resolution":"policy_allowed" if allow else "policy_denied",
                     "resolved_automatically":True})
         else:
             permission = self.permission_store.resolve_permission_request(
@@ -4733,7 +4795,7 @@ class CooperativeChatManager:
             return
         self._close_started = True
         self._closed = True
-        if self.permission_policy in {"deny", "ask"} and self._installed:
+        if self.permission_policy in {"deny", "ask", "allow"} and self._installed:
             bus.off(Method.PROVIDER_EVENT, self._handle_provider_event)
         if self.permission_policy == "ask" and self._installed:
             bus.off(Method.SESSION_CHANGED, self._handle_permission_session_changed)
